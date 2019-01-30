@@ -8,6 +8,16 @@
  *
  */
 
+// changes:
+// + `--replace-create-class-module=true` option added to replace `createReactClass()`
+//   usage from `create-react-class` module
+// + remove any existing `create-react-class` module import when 
+//   `--replace-create-class-module=true` and conversion is done
+// + `prefer-named-classes=true` option added to create named class declarations 
+//   instead of inline anonymous class declarations when possible, for cases of HOC chained calls
+// + `--class-suffix=Component` option added to specify a suffix to append to generated class name
+//   when `prefer-named-classes=true` option is used
+
 'use strict';
 
 const { basename, extname, dirname } = require('path');
@@ -96,6 +106,15 @@ module.exports = (file, api, options) => {
     }
   }
 
+  const REPLACE_CREATE_CLASS_MODULE = options['replace-create-class-module'] === true ||
+    false;
+  
+  const PREFER_NAMED_CLASSES = options['prefer-named-classes'] === true ||
+    false;
+
+  const ANONYMOUS_COMPONENT_CLASS_SUFFIX = options['class-suffix'] ||
+    'Component';
+
   // ---------------------------------------------------------------------------
   // Helpers
   const createFindPropFn = prop => property => (
@@ -170,6 +189,43 @@ module.exports = (file, api, options) => {
     }
 
     return hasSingleReturnStatement(getInitialState.value);
+  };
+
+  const findAllCreateReactClassCalls = path =>
+    path.find(j.CallExpression, {
+      callee: {
+        type: 'Identifier',
+        name: CREATE_CLASS_VARIABLE_NAME,
+      }
+    });
+
+  const getComponentDisplayName = path => {
+    let displayName;
+    while (path && displayName === undefined) {
+      switch (path.node.type) {
+        case 'ExportDefaultDeclaration':
+          displayName = basename(file.path, extname(file.path));
+          if (displayName === 'index') {
+            // ./{module name}/index.js
+            displayName = basename(dirname(file.path));
+          }
+          break;
+        case 'VariableDeclarator':
+          displayName = path.node.id.name;
+          break;
+        case 'AssignmentExpression':
+          displayName = path.node.left.name;
+          break;
+        case 'Property':
+          displayName = path.node.key.name;
+          break;
+        case 'Statement':
+          displayName = null;
+          break;
+      }
+      path = path.parent;
+    }
+    return displayName;
   };
 
   // ---------------------------------------------------------------------------
@@ -1058,7 +1114,7 @@ module.exports = (file, api, options) => {
 
   const updateToClass = (classPath) => {
     const specPath = ReactUtils.directlyGetCreateClassSpec(classPath);
-    const name = ReactUtils.directlyGetComponentName(classPath);
+    let name = ReactUtils.directlyGetComponentName(classPath);
     const statics = collectStatics(specPath);
     const properties = collectNonStaticProperties(specPath);
     const comments = getComments(classPath);
@@ -1089,16 +1145,57 @@ module.exports = (file, api, options) => {
         'PureComponent' :
         'Component';
 
-    j(path).replaceWith(
-      createESClass(
-        name,
-        baseClassName,
-        staticProperties,
-        getInitialState,
-        properties,
-        comments
-      )
-    );
+    if (PREFER_NAMED_CLASSES) {
+      // Check if we are updating a reference inside a function call or property assignment
+      // For things like `var Foo = wrapper(createReactClass({...}))`, 
+      // we want to create a named class declaration instead of replacing
+      // with an anonymous class, if possible
+      const isInsideFunctionCall = (path) => 
+        path.parentPath && 
+        path.parentPath.name === 'arguments';
+  
+      const isInsidePropertyAssignment = (path) => 
+        path.parentPath && 
+        path.parentPath.value && 
+        path.parentPath.value.type === 'Property';
+  
+      if (isInsideFunctionCall(path) || isInsidePropertyAssignment(path)) {
+        const declaration = j(classPath).closest(j.VariableDeclaration);
+        if (declaration.size() > 0) {
+          if (!name) {
+            name = getComponentDisplayName(path);
+          }
+  
+          if (name) {
+            name += ANONYMOUS_COMPONENT_CLASS_SUFFIX;
+  
+            // add class declaration before variable declaration
+            // because class declarations are not "hoisted"
+            declaration.insertBefore(createESClass(
+              name,
+              baseClassName,
+              staticProperties,
+              getInitialState,
+              properties,
+              comments
+            ));
+  
+            // replace inline class declaration with class name reference
+            j(path).replaceWith(j.identifier(name));
+            return;
+          }
+        }
+      }
+    }
+
+    j(path).replaceWith(createESClass(
+      name,
+      baseClassName,
+      staticProperties,
+      getInitialState,
+      properties,
+      comments
+    ));
   };
 
   const addDisplayName = (displayName, specPath) => {
@@ -1125,32 +1222,7 @@ module.exports = (file, api, options) => {
     if (!NO_DISPLAY_NAME) {
       if (specPath) {
         // Add a displayName property to the spec object
-        let path = classPath;
-        let displayName;
-        while (path && displayName === undefined) {
-          switch (path.node.type) {
-            case 'ExportDefaultDeclaration':
-              displayName = basename(file.path, extname(file.path));
-              if (displayName === 'index') {
-                // ./{module name}/index.js
-                displayName = basename(dirname(file.path));
-              }
-              break;
-            case 'VariableDeclarator':
-              displayName = path.node.id.name;
-              break;
-            case 'AssignmentExpression':
-              displayName = path.node.left.name;
-              break;
-            case 'Property':
-              displayName = path.node.key.name;
-              break;
-            case 'Statement':
-              displayName = null;
-              break;
-          }
-          path = path.parent;
-        }
+        const displayName = getComponentDisplayName(classPath);
         if (displayName) {
           addDisplayName(displayName, specPath);
         }
@@ -1196,10 +1268,41 @@ module.exports = (file, api, options) => {
       root.get().node.comments = topComments;
     };
 
+    const removeImport = (path, type) => {
+      var removePath = null;
+      let shouldReinsertComment = false;
+
+      if (type === 'require') {
+        const bodyNode = path.parentPath.parentPath.parentPath.value;
+        const variableDeclarationNode = path.parentPath.parentPath.value;
+
+        if (variableDeclarationNode.declarations.length === 1) {
+          removePath = path.parentPath.parentPath;
+          shouldReinsertComment = bodyNode.indexOf(variableDeclarationNode) === 0;
+        } else {
+          removePath = path;
+        }
+      } else {
+        const importDeclarationNode = path.value;
+        const bodyNode = path.parentPath.value;
+
+        removePath = path;
+        shouldReinsertComment = bodyNode.indexOf(importDeclarationNode) === 0;
+      }
+
+      j(removePath).remove();
+      if (shouldReinsertComment) {
+        reinsertTopComments();
+      }
+    };
+
     let didTransform = false;
     let didFallback = false;
 
-    const path = ReactUtils.findAllReactCreateClassCalls(root);
+    const path = REPLACE_CREATE_CLASS_MODULE
+      ? findAllCreateReactClassCalls(root)
+      : ReactUtils.findAllReactCreateClassCalls(root);
+
     if (NO_CONVERSION) {
       path.forEach(childPath => {
         fallbackToCreateClassModule(childPath);
@@ -1221,7 +1324,7 @@ module.exports = (file, api, options) => {
         ) {
           didTransform = true;
           updateToClass(childPath);
-        } else {
+        } else if (!REPLACE_CREATE_CLASS_MODULE) {
           didFallback = true;
           fallbackToCreateClassModule(childPath);
         }
@@ -1283,31 +1386,16 @@ module.exports = (file, api, options) => {
       // prune removed requires
       if (pureRenderMixinPathAndBinding) {
         const {binding, path, type} = pureRenderMixinPathAndBinding;
-        let shouldReinsertComment = false;
         if (findUnusedVariables(path, binding).size() === 0) {
-          var removePath = null;
-          if (type === 'require') {
-            const bodyNode = path.parentPath.parentPath.parentPath.value;
-            const variableDeclarationNode = path.parentPath.parentPath.value;
+          removeImport(path, type);
+        }
+      }
 
-            if (variableDeclarationNode.declarations.length === 1) {
-              removePath = path.parentPath.parentPath;
-              shouldReinsertComment = bodyNode.indexOf(variableDeclarationNode) === 0;
-            } else {
-              removePath = path;
-            }
-          } else {
-            const importDeclarationNode = path.value;
-            const bodyNode = path.parentPath.value;
-
-            removePath = path;
-            shouldReinsertComment = bodyNode.indexOf(importDeclarationNode) === 0;
-          }
-
-          j(removePath).remove();
-          if (shouldReinsertComment) {
-            reinsertTopComments();
-          }
+      if (REPLACE_CREATE_CLASS_MODULE && !didFallback) {
+        const createClassModuleImportPathAndBinding = findRequirePathAndBinding(CREATE_CLASS_MODULE_NAME);
+        if (createClassModuleImportPathAndBinding) {
+          const { path, type } = createClassModuleImportPathAndBinding;
+          removeImport(path, type);
         }
       }
     }
